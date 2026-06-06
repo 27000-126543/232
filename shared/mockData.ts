@@ -417,6 +417,28 @@ export const mockRecommendations: Recommendation[] = [
   },
 ];
 
+export function generateRecommendations(events: CommunityEvent[]): Recommendation[] {
+  const baseRecs = [...mockRecommendations];
+  
+  events.forEach((event, index) => {
+    const trafficMultiplier = Math.min(event.estimatedFootTraffic / 1000, 3);
+    const isAddLocker = Math.random() > 0.5;
+    
+    baseRecs.unshift({
+      id: `rec-event-${Date.now()}-${index}`,
+      type: isAddLocker ? 'add_locker' : 'transfer',
+      typeName: isAddLocker ? '新增柜机' : '柜机调拨',
+      region: event.region,
+      description: `${event.community}${event.name}活动预计人流${event.estimatedFootTraffic}人次，建议${isAddLocker ? '新增临时柜机' : '从周边调拨柜机'}以应对取件高峰`,
+      cost: isAddLocker ? Math.round(35000 * trafficMultiplier) : Math.round(5000 * trafficMultiplier),
+      estimatedBenefit: Math.round(25000 * trafficMultiplier),
+      priority: event.estimatedFootTraffic > 2000 ? 'high' : event.estimatedFootTraffic > 1000 ? 'medium' : 'low',
+    });
+  });
+
+  return baseRecs.slice(0, 8);
+}
+
 function generateWeeklyReports(): WeeklyReport[] {
   const reports: WeeklyReport[] = [];
   const now = new Date();
