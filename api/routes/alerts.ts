@@ -1,19 +1,15 @@
 import { Router, type Request, type Response } from 'express';
-import { dataCleaner } from '../data-cleaning';
-import type { Alert } from '../../shared/types';
+import { dataCleaner } from '../data-cleaning.js';
+import { db } from '../database/index.js';
+import type { Alert } from '../../shared/types.js';
 
-export interface AlertInternal extends Alert {
-  lastCheckedAt: string;
-  usageHistory: { time: string; usage: number }[];
-}
+const LOW_USAGE_THRESHOLD = 10;
+const LOW_USAGE_DURATION = 3 * 3600000;
+const FAULT_TIMEOUT = 2 * 3600000;
+const ESCALATION_TIMEOUT = 4 * 3600000;
 
 class AlertEngine {
-  private alerts: Map<string, AlertInternal> = new Map();
   private checkInterval: NodeJS.Timeout | null = null;
-  private readonly LOW_USAGE_THRESHOLD = 10;
-  private readonly LOW_USAGE_DURATION = 3 * 3600000;
-  private readonly FAULT_TIMEOUT = 2 * 3600000;
-  private readonly ESCALATION_TIMEOUT = 4 * 3600000;
 
   start() {
     if (this.checkInterval) return;
@@ -31,168 +27,226 @@ class AlertEngine {
   }
 
   private checkAllLockers() {
-    const archives = dataCleaner.getAllArchives();
     const now = new Date();
+    const lockers = db.prepare('SELECT * FROM lockers').all() as any[];
 
-    archives.forEach(archive => {
-      const lockerId = archive.locker.id;
-
-      const avgUsage = dataCleaner.getLockerUsageRate(lockerId, 3);
-      if (avgUsage < this.LOW_USAGE_THRESHOLD) {
-        this.checkLowUsageAlert(archive, avgUsage, now);
+    lockers.forEach(locker => {
+      const avgUsage = dataCleaner.getLockerUsageRate(locker.id, 3);
+      if (avgUsage < LOW_USAGE_THRESHOLD && avgUsage > 0) {
+        this.checkLowUsageAlert(locker, avgUsage, now);
       }
 
-      const activeFaults = dataCleaner.getActiveFaults(lockerId);
+      const activeFaults = dataCleaner.getActiveFaults(locker.id);
       activeFaults.forEach(fault => {
         const faultDuration = now.getTime() - new Date(fault.startTime).getTime();
-        if (faultDuration > this.FAULT_TIMEOUT) {
-          this.checkFaultAlert(archive, fault, now);
+        if (faultDuration > FAULT_TIMEOUT) {
+          this.checkFaultAlert(locker, fault, now);
         }
       });
-
-      this.checkEscalation(lockerId, now);
     });
+
+    this.checkEscalation(now);
   }
 
-  private checkLowUsageAlert(archive: any, avgUsage: number, now: Date) {
-    const alertId = `low_usage_${archive.locker.id}`;
-    const existing = this.alerts.get(alertId);
+  private checkLowUsageAlert(locker: any, avgUsage: number, now: Date) {
+    const alertId = `low_usage_${locker.id}`;
+    const existing = db.prepare('SELECT * FROM alerts WHERE id = ?').get(alertId) as any;
 
     if (!existing) {
-      const alert: AlertInternal = {
-        id: alertId,
-        lockerId: archive.locker.id,
-        lockerName: archive.locker.name,
-        region: archive.locker.region,
-        level: 1,
-        type: 'low_usage',
-        message: `该柜机连续3小时使用率低于10%，当前平均使用率：${avgUsage.toFixed(1)}%`,
-        createdAt: now.toISOString(),
-        status: 'pending',
-        lastCheckedAt: now.toISOString(),
-        usageHistory: [{ time: now.toISOString(), usage: avgUsage }],
-      };
-      this.alerts.set(alertId, alert);
-      console.log(`[AlertEngine] 生成低使用率预警: ${archive.locker.name}, 使用率: ${avgUsage.toFixed(1)}%`);
+      db.prepare(`
+        INSERT INTO alerts (
+          id, locker_id, locker_name, region, level, type, message,
+          status, created_at, last_checked_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        alertId,
+        locker.id,
+        locker.name,
+        locker.region,
+        1,
+        'low_usage',
+        `该柜机连续3小时使用率低于10%，当前平均使用率：${avgUsage.toFixed(1)}%`,
+        'pending',
+        now.toISOString(),
+        now.toISOString()
+      );
+      console.log(`[AlertEngine] 生成低使用率预警: ${locker.name}, 使用率: ${avgUsage.toFixed(1)}%`);
     } else {
-      existing.lastCheckedAt = now.toISOString();
-      existing.usageHistory.push({ time: now.toISOString(), usage: avgUsage });
-      if (existing.usageHistory.length > 60) existing.usageHistory.shift();
-      existing.message = `该柜机连续3小时使用率低于10%，当前平均使用率：${avgUsage.toFixed(1)}%`;
+      db.prepare(`
+        UPDATE alerts 
+        SET message = ?, last_checked_at = ?
+        WHERE id = ?
+      `).run(
+        `该柜机连续3小时使用率低于10%，当前平均使用率：${avgUsage.toFixed(1)}%`,
+        now.toISOString(),
+        alertId
+      );
     }
   }
 
-  private checkFaultAlert(archive: any, fault: any, now: Date) {
-    const alertId = `fault_${archive.locker.id}_${fault.id}`;
-    const existing = this.alerts.get(alertId);
+  private checkFaultAlert(locker: any, fault: any, now: Date) {
+    const alertId = `fault_${locker.id}_${fault.id}`;
+    const existing = db.prepare('SELECT * FROM alerts WHERE id = ?').get(alertId) as any;
+
+    const duration = Math.floor((now.getTime() - new Date(fault.startTime).getTime()) / 60000);
 
     if (!existing) {
-      const duration = Math.floor((now.getTime() - new Date(fault.startTime).getTime()) / 60000);
-      const alert: AlertInternal = {
-        id: alertId,
-        lockerId: archive.locker.id,
-        lockerName: archive.locker.name,
-        region: archive.locker.region,
-        level: 1,
-        type: 'fault_timeout',
-        message: `故障类型: ${fault.faultType} (${fault.errorCode})，已持续${duration}分钟未修复`,
-        createdAt: now.toISOString(),
-        status: 'pending',
-        lastCheckedAt: now.toISOString(),
-        usageHistory: [],
-      };
-      this.alerts.set(alertId, alert);
-      console.log(`[AlertEngine] 生成故障超时预警: ${archive.locker.name}, 故障: ${fault.faultType}`);
+      db.prepare(`
+        INSERT INTO alerts (
+          id, locker_id, locker_name, region, level, type, message,
+          status, created_at, last_checked_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        alertId,
+        locker.id,
+        locker.name,
+        locker.region,
+        1,
+        'fault_timeout',
+        `故障类型: ${fault.faultType} (${fault.errorCode})，已持续${duration}分钟未修复`,
+        'pending',
+        now.toISOString(),
+        now.toISOString()
+      );
+      console.log(`[AlertEngine] 生成故障超时预警: ${locker.name}, 故障: ${fault.faultType}`);
     } else {
-      const duration = Math.floor((now.getTime() - new Date(fault.startTime).getTime()) / 60000);
-      existing.lastCheckedAt = now.toISOString();
-      existing.message = `故障类型: ${fault.faultType} (${fault.errorCode})，已持续${duration}分钟未修复`;
+      db.prepare(`
+        UPDATE alerts 
+        SET message = ?, last_checked_at = ?
+        WHERE id = ?
+      `).run(
+        `故障类型: ${fault.faultType} (${fault.errorCode})，已持续${duration}分钟未修复`,
+        now.toISOString(),
+        alertId
+      );
     }
   }
 
-  private checkEscalation(lockerId: string, now: Date) {
-    this.alerts.forEach(alert => {
-      if (alert.lockerId !== lockerId) return;
-      if (alert.level !== 1 || alert.status === 'resolved') return;
+  private checkEscalation(now: Date) {
+    const pendingAlerts = db.prepare(`
+      SELECT * FROM alerts 
+      WHERE level = 1 AND status IN ('pending', 'processing')
+    `).all() as any[];
 
-      const age = now.getTime() - new Date(alert.createdAt).getTime();
-      if (age > this.ESCALATION_TIMEOUT && alert.status !== 'escalated') {
-        alert.level = 2;
-        alert.status = 'escalated';
-        console.log(`[AlertEngine] 预警升级为二级: ${alert.lockerName}, 类型: ${alert.type}`);
+    pendingAlerts.forEach(alert => {
+      const age = now.getTime() - new Date(alert.created_at).getTime();
+      if (age > ESCALATION_TIMEOUT) {
+        db.prepare(`
+          UPDATE alerts 
+          SET level = 2, status = 'escalated', escalated_at = ?
+          WHERE id = ? AND level = 1
+        `).run(now.toISOString(), alert.id);
+        console.log(`[AlertEngine] 预警升级为二级: ${alert.locker_name}, 类型: ${alert.type}`);
       }
     });
   }
 
-  handleAlert(alertId: string, action: string, handledBy: string): AlertInternal | null {
-    const alert = this.alerts.get(alertId);
+  handleAlert(alertId: string, action: string, handledBy: string): any {
+    const alert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(alertId) as any;
     if (!alert) return null;
+
+    const now = new Date().toISOString();
 
     if (action === 'resolve') {
-      alert.status = 'resolved';
-      alert.handledAt = new Date().toISOString();
-      alert.handledBy = handledBy;
-      
+      db.prepare(`
+        UPDATE alerts 
+        SET status = 'resolved', handled_at = ?, handled_by = ?
+        WHERE id = ?
+      `).run(now, handledBy, alertId);
+
       if (alert.type === 'fault_timeout') {
-        const faultId = alert.id.split('_').slice(2).join('_');
-        dataCleaner.resolveFault(alert.lockerId, faultId);
+        const parts = alert.id.split('_');
+        const faultId = parts.slice(2).join('_');
+        dataCleaner.resolveFault(alert.locker_id, faultId);
       }
     } else if (action === 'process') {
-      alert.status = 'processing';
-      alert.handledAt = new Date().toISOString();
-      alert.handledBy = handledBy;
+      db.prepare(`
+        UPDATE alerts 
+        SET status = 'processing', handled_at = ?, handled_by = ?
+        WHERE id = ?
+      `).run(now, handledBy, alertId);
     }
 
-    return alert;
+    return db.prepare('SELECT * FROM alerts WHERE id = ?').get(alertId);
   }
 
-  escalateAlert(alertId: string): AlertInternal | null {
-    const alert = this.alerts.get(alertId);
+  escalateAlert(alertId: string): any {
+    const alert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(alertId) as any;
     if (!alert) return null;
-    alert.level = 2;
-    alert.status = 'escalated';
-    return alert;
+
+    db.prepare(`
+      UPDATE alerts 
+      SET level = 2, status = 'escalated', escalated_at = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), alertId);
+
+    return db.prepare('SELECT * FROM alerts WHERE id = ?').get(alertId);
   }
 
   getAlerts(filters?: { level?: number; status?: string; region?: string; page?: number; pageSize?: number }) {
-    let list = Array.from(this.alerts.values());
+    let query = 'SELECT * FROM alerts WHERE 1=1';
+    const params: any[] = [];
 
     if (filters?.level) {
-      list = list.filter(a => a.level === filters.level);
+      query += ' AND level = ?';
+      params.push(filters.level);
     }
     if (filters?.status) {
       if (filters.status === 'pending') {
-        list = list.filter(a => a.status === 'pending' || a.status === 'processing');
+        query += ' AND status IN (?, ?)';
+        params.push('pending', 'processing');
       } else {
-        list = list.filter(a => a.status === filters.status);
+        query += ' AND status = ?';
+        params.push(filters.status);
       }
     }
     if (filters?.region) {
-      list = list.filter(a => a.region === filters.region);
+      query += ' AND region = ?';
+      params.push(filters.region);
     }
 
-    list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    query += ' ORDER BY created_at DESC';
+
+    const all = db.prepare(query).all(...params) as any[];
 
     const page = filters?.page || 1;
     const pageSize = filters?.pageSize || 20;
     const start = (page - 1) * pageSize;
-    const paginatedList = list.slice(start, start + pageSize);
+    const paginatedList = all.slice(start, start + pageSize);
+
+    const list = paginatedList.map(a => ({
+      id: a.id,
+      lockerId: a.locker_id,
+      lockerName: a.locker_name,
+      region: a.region,
+      level: a.level,
+      type: a.type,
+      message: a.message,
+      createdAt: a.created_at,
+      status: a.status,
+      handledAt: a.handled_at,
+      handledBy: a.handled_by,
+    }));
 
     return {
-      list: paginatedList,
-      total: list.length,
+      list,
+      total: all.length,
       page,
       pageSize,
     };
   }
 
   getStats() {
-    const all = Array.from(this.alerts.values());
+    const level1 = db.prepare("SELECT COUNT(*) as count FROM alerts WHERE level = 1 AND status != 'resolved'").get() as any;
+    const level2 = db.prepare("SELECT COUNT(*) as count FROM alerts WHERE level = 2 AND status != 'resolved'").get() as any;
+    const handled = db.prepare("SELECT COUNT(*) as count FROM alerts WHERE status = 'resolved'").get() as any;
+    const pending = db.prepare("SELECT COUNT(*) as count FROM alerts WHERE status IN ('pending', 'processing')").get() as any;
+
     return {
-      level1: all.filter(a => a.level === 1 && a.status !== 'resolved').length,
-      level2: all.filter(a => a.level === 2 && a.status !== 'resolved').length,
-      handled: all.filter(a => a.status === 'resolved').length,
-      pending: all.filter(a => a.status === 'pending' || a.status === 'processing').length,
+      level1: level1.count,
+      level2: level2.count,
+      handled: handled.count,
+      pending: pending.count,
     };
   }
 }

@@ -19,6 +19,8 @@ import forecastRoutes from './routes/forecast.js';
 import reportsRoutes from './routes/reports.js';
 import { dataCollector } from './data-collection.js';
 import { dataCleaner } from './data-cleaning.js';
+import { initDatabase } from './database/index.js';
+import { seedDatabase } from './database/seed.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,10 +40,38 @@ app.use('/api/approvals', approvalsRoutes);
 app.use('/api/forecast', forecastRoutes);
 app.use('/api/reports', reportsRoutes);
 
+app.post('/api/events', (req: Request, res: Response): void => {
+  try {
+    const events = Array.isArray(req.body) ? req.body : [req.body];
+    const result = dataCollector.receiveBatchEvents(events);
+    res.json({ success: true, data: result });
+  } catch (error: any) {
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/events/batch', (req: Request, res: Response): void => {
+  try {
+    const { events } = req.body;
+    if (!Array.isArray(events)) {
+      res.status(400).json({ success: false, error: 'events 必须是数组' });
+      return;
+    }
+    const result = dataCollector.receiveBatchEvents(events);
+    res.json({ success: true, data: result });
+  } catch (error: any) {
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+initDatabase();
+seedDatabase();
+
 dataCollector.start();
 alertEngine.start();
 approvalEngine.start();
 console.log('=== 智能快递柜运营平台后端服务启动 ===');
+console.log('- SQLite数据库: 已初始化');
 console.log('- 数据接入服务: 已启动 (每2秒采集)');
 console.log('- 数据清洗服务: 已启动');
 console.log('- 预警引擎: 已启动 (每分钟检查)');
@@ -109,23 +139,26 @@ app.get('/api/data/stream', (req: Request, res: Response): void => {
  */
 app.get('/api/data/archives', (req: Request, res: Response): void => {
   const region = req.query.region as string;
-  let archives = dataCleaner.getAllArchives();
+  const lockers = dataCleaner.getAllLockerDetails();
   
+  let filtered = lockers;
   if (region) {
-    archives = archives.filter(a => a.locker.region === region);
+    filtered = lockers.filter(l => l.region === region);
   }
 
-  res.json({
-    success: true,
-    data: archives.map(a => ({
-      lockerId: a.locker.id,
-      lockerName: a.locker.name,
-      status: a.locker.status,
-      todayUsage: a.locker.todayUsage.toFixed(1),
-      activeFaults: a.activeFaults.filter(f => !f.resolved).length,
-      lastUpdate: a.lastUpdate,
-    })),
+  const data = filtered.map(l => {
+    const activeFaults = dataCleaner.getActiveFaults(l.id);
+    return {
+      lockerId: l.id,
+      lockerName: l.name,
+      status: l.status,
+      todayUsage: l.todayUsage.toFixed(1),
+      activeFaults: activeFaults.length,
+      lastUpdate: new Date().toISOString(),
+    };
   });
+
+  res.json({ success: true, data });
 });
 
 /**

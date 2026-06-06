@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { mockLockers } from '../shared/mockData';
+import { db } from './database/index.js';
 
 export type RawDataType = 'pickup' | 'delivery' | 'fault' | 'restock' | 'scan';
 
@@ -10,143 +10,228 @@ export interface RawDataRecord {
   timestamp: string;
   data: Record<string, any>;
   receivedAt: string;
+  isValid?: boolean;
+  processed?: number;
 }
 
 interface DataCollectionStats {
   totalCollected: number;
   byType: Record<RawDataType, number>;
   lastCollectionTime: string | null;
+  unprocessedCount: number;
 }
 
 class DataCollector extends EventEmitter {
   private isRunning: boolean = false;
-  private intervalId: NodeJS.Timeout | null = null;
-  private rawDataBuffer: RawDataRecord[] = [];
+  private readIntervalId: NodeJS.Timeout | null = null;
   private stats: DataCollectionStats = {
     totalCollected: 0,
     byType: { pickup: 0, delivery: 0, fault: 0, restock: 0, scan: 0 },
     lastCollectionTime: null,
+    unprocessedCount: 0,
   };
-  private readonly MAX_BUFFER_SIZE = 10000;
 
   start() {
     if (this.isRunning) return;
     this.isRunning = true;
     console.log('[DataCollector] 启动实时数据接入服务...');
+    console.log('[DataCollector] 等待上游系统通过HTTP接口推送事件数据...');
     
-    this.collectData();
-    this.intervalId = setInterval(() => this.collectData(), 2000);
+    this.readFromDatabase();
+    this.readIntervalId = setInterval(() => this.readFromDatabase(), 2000);
   }
 
   stop() {
     this.isRunning = false;
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-      this.intervalId = null;
+    if (this.readIntervalId) {
+      clearInterval(this.readIntervalId);
+      this.readIntervalId = null;
     }
     console.log('[DataCollector] 停止数据接入服务');
   }
 
-  private collectData() {
-    const records: RawDataRecord[] = [];
-    const numRecords = Math.floor(Math.random() * 5) + 1;
-
-    for (let i = 0; i < numRecords; i++) {
-      const locker = mockLockers[Math.floor(Math.random() * mockLockers.length)];
-      const types: RawDataType[] = ['pickup', 'delivery', 'fault', 'restock', 'scan'];
-      const weights = [0.4, 0.25, 0.05, 0.1, 0.2];
+  private readFromDatabase() {
+    try {
+      const rows = db.prepare(`
+        SELECT id, type, locker_id, event_time, data_json, received_at, is_valid, processed
+        FROM raw_events
+        WHERE processed = 0
+        ORDER BY received_at ASC
+        LIMIT 50
+      `).all() as any[];
       
-      let random = Math.random();
-      let type: RawDataType = 'pickup';
-      let cumulative = 0;
-      for (let j = 0; j < types.length; j++) {
-        cumulative += weights[j];
-        if (random < cumulative) {
-          type = types[j];
-          break;
-        }
-      }
+      if (rows.length > 0) {
+        const records: RawDataRecord[] = rows.map(row => ({
+          id: row.id,
+          type: row.type as RawDataType,
+          lockerId: row.locker_id,
+          timestamp: row.event_time,
+          data: JSON.parse(row.data_json || '{}'),
+          receivedAt: row.received_at,
+          isValid: row.is_valid === 1,
+          processed: row.processed,
+        }));
 
-      const record = this.generateRecord(locker.id, type);
-      records.push(record);
-      this.rawDataBuffer.push(record);
-      
-      if (this.rawDataBuffer.length > this.MAX_BUFFER_SIZE) {
-        this.rawDataBuffer.shift();
-      }
+        this.stats.totalCollected += records.length;
+        records.forEach(r => {
+          this.stats.byType[r.type]++;
+        });
+        this.stats.lastCollectionTime = new Date().toISOString();
+        
+        const unprocessed = db.prepare('SELECT COUNT(*) as count FROM raw_events WHERE processed = 0').get() as any;
+        this.stats.unprocessedCount = unprocessed.count;
 
-      this.stats.totalCollected++;
-      this.stats.byType[type]++;
+        this.emit('data:raw', records);
+      }
+    } catch (error) {
+      console.error('[DataCollector] 读取数据库失败:', error);
     }
-
-    this.stats.lastCollectionTime = new Date().toISOString();
-    this.emit('data:raw', records);
   }
 
-  private generateRecord(lockerId: string, type: RawDataType): RawDataRecord {
-    const now = new Date();
-    const baseData: Record<string, any> = {};
-
-    switch (type) {
-      case 'pickup':
-        baseData.trackingNo = `SF${Math.floor(Math.random() * 10000000000)}`;
-        baseData.compartment = Math.floor(Math.random() * 36) + 1;
-        baseData.duration = Math.floor(Math.random() * 180) + 10;
-        baseData.userId = `user_${Math.floor(Math.random() * 10000)}`;
-        break;
-      case 'delivery':
-        baseData.trackingNo = `YD${Math.floor(Math.random() * 10000000000)}`;
-        baseData.compartment = Math.floor(Math.random() * 36) + 1;
-        baseData.courierId = `courier_${Math.floor(Math.random() * 500)}`;
-        baseData.size = ['S', 'M', 'L', 'XL'][Math.floor(Math.random() * 4)];
-        break;
-      case 'fault':
-        const faultTypes = ['door_stuck', 'screen_failure', 'network_error', 'payment_failure', 'system_crash'];
-        baseData.faultType = faultTypes[Math.floor(Math.random() * faultTypes.length)];
-        baseData.faultLevel = Math.random() > 0.3 ? 'minor' : 'major';
-        baseData.errorCode = `ERR-${Math.floor(Math.random() * 1000)}`;
-        break;
-      case 'restock':
-        baseData.operatorId = `op_${Math.floor(Math.random() * 100)}`;
-        baseData.beforeCount = Math.floor(Math.random() * 20);
-        baseData.afterCount = Math.floor(Math.random() * 15) + baseData.beforeCount + 5;
-        baseData.duration = Math.floor(Math.random() * 600) + 60;
-        break;
-      case 'scan':
-        baseData.userId = `user_${Math.floor(Math.random() * 10000)}`;
-        baseData.action = ['open_door', 'query', 'payment', 'bind'][Math.floor(Math.random() * 4)];
-        baseData.deviceType = ['ios', 'android', 'mini_program'][Math.floor(Math.random() * 3)];
-        break;
+  receiveEvent(event: {
+    type: RawDataType;
+    lockerId: string;
+    timestamp?: string;
+    data: Record<string, any>;
+  }): string {
+    const now = new Date().toISOString();
+    const eventId = `raw_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    const locker = db.prepare('SELECT id FROM lockers WHERE id = ?').get(event.lockerId) as any;
+    if (!locker) {
+      throw new Error(`柜机 ${event.lockerId} 不存在`);
     }
 
-    return {
-      id: `raw_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      type,
-      lockerId,
-      timestamp: now.toISOString(),
-      data: baseData,
-      receivedAt: now.toISOString(),
+    const validTypes: RawDataType[] = ['pickup', 'delivery', 'fault', 'restock', 'scan'];
+    if (!validTypes.includes(event.type)) {
+      throw new Error(`无效的事件类型: ${event.type}`);
+    }
+
+    db.prepare(`
+      INSERT INTO raw_events (
+        id, type, locker_id, event_time, data_json, received_at, is_valid, processed, processed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, NULL)
+    `).run(
+      eventId,
+      event.type,
+      event.lockerId,
+      event.timestamp || now,
+      JSON.stringify(event.data),
+      now
+    );
+
+    console.log(`[DataCollector] 接收到上游事件: ${event.type}, 柜机: ${event.lockerId}`);
+    return eventId;
+  }
+
+  receiveBatchEvents(events: Array<{
+    type: RawDataType;
+    lockerId: string;
+    timestamp?: string;
+    data: Record<string, any>;
+  }>): { success: number; failed: number; ids: string[] } {
+    const results: { success: number; failed: number; ids: string[] } = {
+      success: 0,
+      failed: 0,
+      ids: [],
     };
+
+    const tx = db.transaction(() => {
+      events.forEach(event => {
+        try {
+          const id = this.receiveEvent(event);
+          results.ids.push(id);
+          results.success++;
+        } catch (e) {
+          results.failed++;
+        }
+      });
+    });
+
+    tx();
+    return results;
+  }
+
+  markAsProcessed(eventIds: string[]) {
+    if (eventIds.length === 0) return;
+    
+    const placeholders = eventIds.map(() => '?').join(',');
+    const now = new Date().toISOString();
+    db.prepare(`
+      UPDATE raw_events 
+      SET processed = 1, processed_at = ?
+      WHERE id IN (${placeholders})
+    `).run(now, ...eventIds);
   }
 
   getStats(): DataCollectionStats {
-    return { ...this.stats };
+    const unprocessed = db.prepare('SELECT COUNT(*) as count FROM raw_events WHERE processed = 0').get() as any;
+    return {
+      ...this.stats,
+      unprocessedCount: unprocessed.count,
+    };
   }
 
   getRecentRecords(limit: number = 100): RawDataRecord[] {
-    return this.rawDataBuffer.slice(-limit);
+    const rows = db.prepare(`
+      SELECT id, type, locker_id, event_time, data_json, received_at, is_valid, processed
+      FROM raw_events
+      ORDER BY received_at DESC
+      LIMIT ?
+    `).all(limit) as any[];
+
+    return rows.map(row => ({
+      id: row.id,
+      type: row.type as RawDataType,
+      lockerId: row.locker_id,
+      timestamp: row.event_time,
+      data: JSON.parse(row.data_json || '{}'),
+      receivedAt: row.received_at,
+      isValid: row.is_valid === 1,
+      processed: row.processed,
+    }));
   }
 
   getRecordsByLocker(lockerId: string, limit: number = 50): RawDataRecord[] {
-    return this.rawDataBuffer
-      .filter(r => r.lockerId === lockerId)
-      .slice(-limit);
+    const rows = db.prepare(`
+      SELECT id, type, locker_id, event_time, data_json, received_at, is_valid, processed
+      FROM raw_events
+      WHERE locker_id = ?
+      ORDER BY received_at DESC
+      LIMIT ?
+    `).all(lockerId, limit) as any[];
+
+    return rows.map(row => ({
+      id: row.id,
+      type: row.type as RawDataType,
+      lockerId: row.locker_id,
+      timestamp: row.event_time,
+      data: JSON.parse(row.data_json || '{}'),
+      receivedAt: row.received_at,
+      isValid: row.is_valid === 1,
+      processed: row.processed,
+    }));
   }
 
   getRecordsByType(type: RawDataType, limit: number = 50): RawDataRecord[] {
-    return this.rawDataBuffer
-      .filter(r => r.type === type)
-      .slice(-limit);
+    const rows = db.prepare(`
+      SELECT id, type, locker_id, event_time, data_json, received_at, is_valid, processed
+      FROM raw_events
+      WHERE type = ?
+      ORDER BY received_at DESC
+      LIMIT ?
+    `).all(type, limit) as any[];
+
+    return rows.map(row => ({
+      id: row.id,
+      type: row.type as RawDataType,
+      lockerId: row.locker_id,
+      timestamp: row.event_time,
+      data: JSON.parse(row.data_json || '{}'),
+      receivedAt: row.received_at,
+      isValid: row.is_valid === 1,
+      processed: row.processed,
+    }));
   }
 }
 
